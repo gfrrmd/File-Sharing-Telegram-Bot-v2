@@ -104,37 +104,37 @@ async def build_join_buttons(client, not_joined_channels, original_code=None):
 
 @app.on_chat_member_updated()
 async def on_member_updated(client, update: ChatMemberUpdated):
-    # ===== DEBUG LOG =====
-    try:
-        old_s = update.old_chat_member.status if update.old_chat_member else "None"
-        new_s = update.new_chat_member.status if update.new_chat_member else "None"
-        uid   = update.new_chat_member.user.id if update.new_chat_member else "?"
-        print(f"[DEBUG] MemberUpdated | chat={update.chat.id} | user={uid} | {old_s} → {new_s}")
-        print(f"[DEBUG] FORCE_JOIN_CHANNELS={FORCE_JOIN_CHANNELS}")
-        print(f"[DEBUG] db_sent keys={list(db_sent.keys())}")
-    except Exception as dbg_err:
-        print(f"[DEBUG ERROR] {dbg_err}")
-    # ===== END DEBUG =====
-
     if not FORCE_JOIN_CHANNELS or update.chat.id not in FORCE_JOIN_CHANNELS:
-        print(f"[DEBUG] Skipped: chat {update.chat.id} not in FORCE_JOIN_CHANNELS")
         return
 
     new_status = update.new_chat_member.status if update.new_chat_member else None
     old_status = update.old_chat_member.status if update.old_chat_member else None
+    user       = update.new_chat_member.user if update.new_chat_member else None
 
-    was_active = old_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
-    now_gone   = new_status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
-
-    print(f"[DEBUG] was_active={was_active} | now_gone={now_gone}")
-
-    if not (was_active and now_gone):
+    if not user:
         return
 
-    user = update.new_chat_member.user
-    user_id = user.id
+    user_id  = user.id
+    now_gone = new_status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
 
-    print(f"[DEBUG] Triggering revoke for user_id={user_id}, media count={len(db_sent.get(user_id, []))}")
+    # FIX: was_active diperluas dengan RESTRICTED (status user dari approval link)
+    # Sekaligus fallback: kalau user ada di db_sent & now_gone, langsung revoke
+    was_active = old_status in (
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.ADMINISTRATOR,
+        ChatMemberStatus.OWNER,
+        ChatMemberStatus.RESTRICTED  # <-- fix utama
+    )
+
+    # Trigger revoke jika:
+    # 1. Sebelumnya aktif/restricted dan sekarang pergi, ATAU
+    # 2. Fallback: user punya media di db_sent dan sekarang pergi
+    should_revoke = (was_active and now_gone) or (now_gone and user_id in db_sent)
+
+    print(f"[DEBUG] user={user_id} | old={old_status} | new={new_status} | was_active={was_active} | now_gone={now_gone} | should_revoke={should_revoke} | db_sent_count={len(db_sent.get(user_id, []))}")
+
+    if not should_revoke:
+        return
 
     deleted_count = await revoke_all_media(client, user_id)
     print(f"[DEBUG] Revoked {deleted_count} messages for user {user_id}")
