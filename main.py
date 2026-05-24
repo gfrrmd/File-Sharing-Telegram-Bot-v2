@@ -14,8 +14,6 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID"))
 DB_CHANNEL = int(os.environ.get("DB_CHANNEL"))
 
-# Force Join Channels — pisah koma jika lebih dari 1
-# Contoh: -1001234567890,-1009876543210
 RAW_CHANNELS = os.environ.get("FORCE_JOIN_CHANNELS", "")
 FORCE_JOIN_CHANNELS = [
     int(ch.strip()) for ch in RAW_CHANNELS.split(",") if ch.strip()
@@ -23,8 +21,6 @@ FORCE_JOIN_CHANNELS = [
 
 app = Client("file_sharing_bot_v2", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# db_links : { code: message_id_di_db_channel }
-# db_sent  : { user_id: [msg_id_1, msg_id_2, ...] } ← log semua media yang dikirim ke user
 db_links = {}
 db_sent  = {}
 
@@ -35,38 +31,30 @@ def generate_code(length=10):
 
 
 def log_sent(user_id: int, msg_id: int):
-    """Catat message_id media yang dikirim ke user."""
     if user_id not in db_sent:
         db_sent[user_id] = []
     db_sent[user_id].append(msg_id)
 
 
 async def revoke_all_media(client, user_id: int):
-    """
-    Hapus semua media yang pernah dikirim bot ke user.
-    Dibagi per batch 100 (batas Telegram API per request).
-    """
     msg_ids = db_sent.pop(user_id, [])
     if not msg_ids:
         return 0
-
     deleted = 0
     for i in range(0, len(msg_ids), 100):
         batch = msg_ids[i:i + 100]
         try:
             await client.delete_messages(chat_id=user_id, message_ids=batch)
             deleted += len(batch)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[REVOKE ERROR] batch {i}: {e}")
         await asyncio.sleep(0.3)
-
     return deleted
 
 
 # ===================== FORCE JOIN LOGIC =====================
 
 async def check_force_join(client, user_id):
-    """Kembalikan list channel_id yang BELUM di-join oleh user."""
     not_joined = []
     for channel_id in FORCE_JOIN_CHANNELS:
         try:
@@ -87,7 +75,6 @@ async def check_force_join(client, user_id):
 
 
 async def build_join_buttons(client, not_joined_channels, original_code=None):
-    """Tombol join langsung (tanpa approval) per channel."""
     buttons = []
     for ch_id in not_joined_channels:
         title = "Channel"
@@ -98,7 +85,6 @@ async def build_join_buttons(client, not_joined_channels, original_code=None):
         except Exception:
             pass
         try:
-            # Link langsung join, tanpa approval
             invite = await client.export_chat_invite_link(ch_id)
         except Exception:
             invite = f"https://t.me/c/{str(ch_id).replace('-100', '')}"
@@ -114,12 +100,24 @@ async def build_join_buttons(client, not_joined_channels, original_code=None):
     return InlineKeyboardMarkup(buttons)
 
 
-# ===================== AUTO REVOKE: DETEKSI USER KELUAR CHANNEL =====================
+# ===================== AUTO REVOKE =====================
 
 @app.on_chat_member_updated()
 async def on_member_updated(client, update: ChatMemberUpdated):
-    """Deteksi user yang keluar / di-kick dari force join channel."""
+    # ===== DEBUG LOG =====
+    try:
+        old_s = update.old_chat_member.status if update.old_chat_member else "None"
+        new_s = update.new_chat_member.status if update.new_chat_member else "None"
+        uid   = update.new_chat_member.user.id if update.new_chat_member else "?"
+        print(f"[DEBUG] MemberUpdated | chat={update.chat.id} | user={uid} | {old_s} → {new_s}")
+        print(f"[DEBUG] FORCE_JOIN_CHANNELS={FORCE_JOIN_CHANNELS}")
+        print(f"[DEBUG] db_sent keys={list(db_sent.keys())}")
+    except Exception as dbg_err:
+        print(f"[DEBUG ERROR] {dbg_err}")
+    # ===== END DEBUG =====
+
     if not FORCE_JOIN_CHANNELS or update.chat.id not in FORCE_JOIN_CHANNELS:
+        print(f"[DEBUG] Skipped: chat {update.chat.id} not in FORCE_JOIN_CHANNELS")
         return
 
     new_status = update.new_chat_member.status if update.new_chat_member else None
@@ -128,16 +126,19 @@ async def on_member_updated(client, update: ChatMemberUpdated):
     was_active = old_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
     now_gone   = new_status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
 
+    print(f"[DEBUG] was_active={was_active} | now_gone={now_gone}")
+
     if not (was_active and now_gone):
         return
 
     user = update.new_chat_member.user
     user_id = user.id
 
-    # Hapus semua media yang pernah dikirim bot ke user ini
-    deleted_count = await revoke_all_media(client, user_id)
+    print(f"[DEBUG] Triggering revoke for user_id={user_id}, media count={len(db_sent.get(user_id, []))}")
 
-    # Notifikasi ke user
+    deleted_count = await revoke_all_media(client, user_id)
+    print(f"[DEBUG] Revoked {deleted_count} messages for user {user_id}")
+
     try:
         await client.send_message(
             chat_id=user_id,
@@ -148,10 +149,9 @@ async def on_member_updated(client, update: ChatMemberUpdated):
                 "Jika ingin mengakses kembali, silakan join ulang channel dan minta link baru ke Admin."
             )
         )
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[DEBUG] Gagal kirim notif ke user: {e}")
 
-    # Notifikasi ke admin
     try:
         username = f"@{user.username}" if user.username else user.first_name
         channel_name = update.chat.title or str(update.chat.id)
@@ -164,8 +164,8 @@ async def on_member_updated(client, update: ChatMemberUpdated):
                 f"🗑️ Media dihapus: **{deleted_count} pesan**"
             )
         )
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[DEBUG] Gagal kirim notif ke admin: {e}")
 
 
 # ===================== USER INTERFACE =====================
@@ -189,7 +189,6 @@ async def start_command(client, message):
                     )
                     return
 
-            # Sudah join semua → kirim file & catat ke db_sent
             try:
                 sent = await client.copy_message(
                     chat_id=message.chat.id,
@@ -198,8 +197,10 @@ async def start_command(client, message):
                     protect_content=True
                 )
                 log_sent(message.from_user.id, sent.id)
-            except Exception:
+                print(f"[DEBUG] Sent media to user={message.from_user.id}, msg_id={sent.id}")
+            except Exception as e:
                 await message.reply_text("❌ Gagal mengambil file. Pastikan bot adalah Admin di Channel Database.")
+                print(f"[DEBUG] copy_message error: {e}")
         else:
             await message.reply_text("❌ Link kadaluwarsa atau tidak valid.")
 
@@ -218,7 +219,7 @@ async def start_command(client, message):
             )
 
 
-# ===================== CALLBACK: CEK ULANG JOIN =====================
+# ===================== CALLBACK =====================
 
 @app.on_callback_query(filters.regex(r"^check_join:.+"))
 async def recheck_join(client, callback_query):
@@ -249,6 +250,7 @@ async def recheck_join(client, callback_query):
                         protect_content=True
                     )
                     log_sent(callback_query.from_user.id, sent.id)
+                    print(f"[DEBUG] Sent via callback to user={callback_query.from_user.id}, msg_id={sent.id}")
                 except Exception as e:
                     await callback_query.message.edit_text(f"❌ Gagal mengirim file: {str(e)}")
             else:
@@ -257,7 +259,7 @@ async def recheck_join(client, callback_query):
             await callback_query.message.edit_text("✅ Kamu sudah terverifikasi! Silakan klik link filenya lagi.")
 
 
-# ===================== ADMIN INTERFACE (UPLOAD) =====================
+# ===================== ADMIN INTERFACE =====================
 
 @app.on_message(filters.private & filters.user(ADMIN_ID) & ~filters.command(["start", "help"]))
 async def admin_upload_handler(client, message):
@@ -279,7 +281,6 @@ async def admin_upload_handler(client, message):
         await message.reply_text(f"❌ Gagal upload: {str(e)}")
 
 
-# Tolak upload jika bukan admin
 @app.on_message(filters.private & ~filters.user(ADMIN_ID) & (filters.document | filters.video | filters.photo))
 async def non_admin_reject(client, message):
     await message.reply_text("🚫 **Akses Ditolak.** Kamu tidak punya izin untuk upload file ke bot ini.")
