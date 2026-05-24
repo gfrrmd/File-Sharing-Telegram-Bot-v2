@@ -2,7 +2,8 @@ import os
 import string
 import random
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ChatMemberStatus
+from pyrogram.enums import ChatMemberStatus
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import UserNotParticipant, ChatAdminRequired, ChannelPrivate
 
 # ===================== KONFIGURASI =====================
@@ -12,8 +13,8 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID"))
 DB_CHANNEL = int(os.environ.get("DB_CHANNEL"))
 
-# ✅ Force Join Channels — isi dengan ID channel yang wajib di-join
-# Bisa 1 atau lebih, pisah koma. Contoh: -1001234567890,-1009876543210
+# Force Join Channels — pisah koma jika lebih dari 1
+# Contoh: -1001234567890,-1009876543210
 RAW_CHANNELS = os.environ.get("FORCE_JOIN_CHANNELS", "")
 FORCE_JOIN_CHANNELS = [
     int(ch.strip()) for ch in RAW_CHANNELS.split(",") if ch.strip()
@@ -38,18 +39,17 @@ async def check_force_join(client, user_id):
     for channel_id in FORCE_JOIN_CHANNELS:
         try:
             member = await client.get_chat_member(channel_id, user_id)
-            # ✅ FIX: Bandingkan dengan ChatMemberStatus enum, bukan string
+            # Gunakan ChatMemberStatus enum (bukan string)
             if member.status in (ChatMemberStatus.BANNED, ChatMemberStatus.LEFT):
                 not_joined.append(channel_id)
         except UserNotParticipant:
-            # User sama sekali tidak ada di channel → belum join
+            # User tidak ada di channel sama sekali
             not_joined.append(channel_id)
         except (ChatAdminRequired, ChannelPrivate):
-            # ✅ FIX: Bot bukan admin atau channel tidak bisa diakses
-            # Anggap belum join agar aman (fail-closed), bukan di-skip
+            # Bot bukan admin atau channel tidak bisa diakses — fail-closed
             not_joined.append(channel_id)
         except Exception:
-            # Error lain yang tidak terduga → anggap belum join agar aman
+            # Error tak terduga — fail-closed agar aman
             not_joined.append(channel_id)
     return not_joined
 
@@ -72,7 +72,6 @@ async def build_join_buttons(client, not_joined_channels, original_code=None):
                 InlineKeyboardButton("🔔 Join Channel", url=f"https://t.me/c/{str(ch_id).replace('-100', '')}")
             ])
 
-    # Tombol cek ulang, bawa kode file agar bisa langsung kirim setelah join
     callback_data = f"check_join:{original_code}" if original_code else "check_join:none"
     buttons.append([
         InlineKeyboardButton("✅ Sudah Join, Coba Lagi", callback_data=callback_data)
@@ -89,7 +88,6 @@ async def start_command(client, message):
         msg_id = db_links.get(code)
 
         if msg_id:
-            # Cek force join terlebih dahulu
             if FORCE_JOIN_CHANNELS:
                 not_joined = await check_force_join(client, message.from_user.id)
                 if not_joined:
@@ -110,7 +108,7 @@ async def start_command(client, message):
                     message_id=msg_id,
                     protect_content=True
                 )
-            except Exception as e:
+            except Exception:
                 await message.reply_text("❌ Gagal mengambil file. Pastikan bot adalah Admin di Channel Database.")
         else:
             await message.reply_text("❌ Link kadaluwarsa atau tidak valid.")
@@ -133,7 +131,7 @@ async def start_command(client, message):
 
 @app.on_callback_query(filters.regex(r"^check_join:.+"))
 async def recheck_join(client, callback_query):
-    data = callback_query.data  # format: "check_join:CODE"
+    data = callback_query.data
     code = data.split(":", 1)[1] if ":" in data else "none"
     user_id = callback_query.from_user.id
 
@@ -148,7 +146,6 @@ async def recheck_join(client, callback_query):
             pass
     else:
         await callback_query.answer("✅ Verifikasi berhasil!", show_alert=True)
-
         if code != "none":
             msg_id = db_links.get(code)
             if msg_id:
