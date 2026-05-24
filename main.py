@@ -2,8 +2,8 @@ import os
 import string
 import random
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import UserNotParticipant
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ChatMemberStatus
+from pyrogram.errors import UserNotParticipant, ChatAdminRequired, ChannelPrivate
 
 # ===================== KONFIGURASI =====================
 API_ID = int(os.environ.get("API_ID"))
@@ -13,7 +13,7 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID"))
 DB_CHANNEL = int(os.environ.get("DB_CHANNEL"))
 
 # ✅ Force Join Channels — isi dengan ID channel yang wajib di-join
-# Bisa 1 atau lebih, contoh: [-1001234567890, -1009876543210]
+# Bisa 1 atau lebih, pisah koma. Contoh: -1001234567890,-1009876543210
 RAW_CHANNELS = os.environ.get("FORCE_JOIN_CHANNELS", "")
 FORCE_JOIN_CHANNELS = [
     int(ch.strip()) for ch in RAW_CHANNELS.split(",") if ch.strip()
@@ -38,12 +38,19 @@ async def check_force_join(client, user_id):
     for channel_id in FORCE_JOIN_CHANNELS:
         try:
             member = await client.get_chat_member(channel_id, user_id)
-            if member.status in ("kicked", "left"):
+            # ✅ FIX: Bandingkan dengan ChatMemberStatus enum, bukan string
+            if member.status in (ChatMemberStatus.BANNED, ChatMemberStatus.LEFT):
                 not_joined.append(channel_id)
         except UserNotParticipant:
+            # User sama sekali tidak ada di channel → belum join
+            not_joined.append(channel_id)
+        except (ChatAdminRequired, ChannelPrivate):
+            # ✅ FIX: Bot bukan admin atau channel tidak bisa diakses
+            # Anggap belum join agar aman (fail-closed), bukan di-skip
             not_joined.append(channel_id)
         except Exception:
-            pass  # skip jika bot bukan admin di channel tersebut
+            # Error lain yang tidak terduga → anggap belum join agar aman
+            not_joined.append(channel_id)
     return not_joined
 
 
@@ -60,9 +67,9 @@ async def build_join_buttons(client, not_joined_channels, original_code=None):
             buttons.append([
                 InlineKeyboardButton(f"🔔 Join {chat.title}", url=invite)
             ])
-        except Exception as e:
+        except Exception:
             buttons.append([
-                InlineKeyboardButton(f"🔔 Join Channel", url=f"https://t.me/c/{str(ch_id).replace('-100', '')}")
+                InlineKeyboardButton("🔔 Join Channel", url=f"https://t.me/c/{str(ch_id).replace('-100', '')}")
             ])
 
     # Tombol cek ulang, bawa kode file agar bisa langsung kirim setelah join
