@@ -34,16 +34,19 @@ def generate_code(length=10):
 # ===================== FORCE JOIN LOGIC =====================
 
 async def check_force_join(client, user_id):
-    """Kembalikan list channel_id yang BELUM di-join oleh user."""
+    """
+    Kembalikan list channel_id yang BELUM di-join oleh user.
+    Termasuk user yang masih dalam status pending approval (RESTRICTED).
+    """
     not_joined = []
     for channel_id in FORCE_JOIN_CHANNELS:
         try:
             member = await client.get_chat_member(channel_id, user_id)
-            # Gunakan ChatMemberStatus enum (bukan string)
-            if member.status in (ChatMemberStatus.BANNED, ChatMemberStatus.LEFT):
+            # Hanya status MEMBER dan ADMINISTRATOR yang dianggap sudah join
+            # RESTRICTED = pending approval, belum diterima
+            if member.status not in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
                 not_joined.append(channel_id)
         except UserNotParticipant:
-            # User tidak ada di channel sama sekali
             not_joined.append(channel_id)
         except (ChatAdminRequired, ChannelPrivate):
             # Bot bukan admin atau channel tidak bisa diakses — fail-closed
@@ -55,26 +58,39 @@ async def check_force_join(client, user_id):
 
 
 async def build_join_buttons(client, not_joined_channels, original_code=None):
-    """Buat InlineKeyboardMarkup dengan tombol join untuk tiap channel."""
+    """
+    Buat tombol join per channel menggunakan invite link dengan approval
+    (creates_join_request=True), sehingga user harus disetujui admin dulu.
+    """
     buttons = []
     for ch_id in not_joined_channels:
         try:
             chat = await client.get_chat(ch_id)
+            # Buat invite link dengan mode approval (request to join)
+            invite_obj = await client.create_chat_invite_link(
+                chat_id=ch_id,
+                creates_join_request=True
+            )
+            invite = invite_obj.invite_link
+        except Exception:
+            # Fallback: coba export invite link biasa
             try:
                 invite = await client.export_chat_invite_link(ch_id)
             except Exception:
                 invite = f"https://t.me/c/{str(ch_id).replace('-100', '')}"
-            buttons.append([
-                InlineKeyboardButton(f"🔔 Join {chat.title}", url=invite)
-            ])
+
+        try:
+            title = chat.title
         except Exception:
-            buttons.append([
-                InlineKeyboardButton("🔔 Join Channel", url=f"https://t.me/c/{str(ch_id).replace('-100', '')}")
-            ])
+            title = "Channel"
+
+        buttons.append([
+            InlineKeyboardButton(f"📎 Request Join {title}", url=invite)
+        ])
 
     callback_data = f"check_join:{original_code}" if original_code else "check_join:none"
     buttons.append([
-        InlineKeyboardButton("✅ Sudah Join, Coba Lagi", callback_data=callback_data)
+        InlineKeyboardButton("✅ Sudah Disetujui Admin, Coba Lagi", callback_data=callback_data)
     ])
     return InlineKeyboardMarkup(buttons)
 
@@ -94,8 +110,9 @@ async def start_command(client, message):
                     buttons = await build_join_buttons(client, not_joined, original_code=code)
                     await message.reply_text(
                         "⚠️ **Akses Ditolak!**\n\n"
-                        "Kamu harus join semua channel berikut terlebih dahulu "
-                        "untuk bisa mengakses file ini:",
+                        "Kamu harus request join dan **menunggu persetujuan admin** "
+                        "di semua channel berikut sebelum bisa mengakses file ini:\n\n"
+                        "📌 Klik tombol → Request Join → Tunggu disetujui admin → Klik **Sudah Disetujui**.",
                         reply_markup=buttons
                     )
                     return
@@ -118,7 +135,8 @@ async def start_command(client, message):
             await message.reply_text(
                 "👋 **Halo Admin!**\n\nKirim foto, video, atau dokumen ke sini "
                 "untuk diubah menjadi link sharing otomatis.\n\n"
-                f"📌 Force Join aktif untuk **{len(FORCE_JOIN_CHANNELS)} channel**."
+                f"📌 Force Join aktif untuk **{len(FORCE_JOIN_CHANNELS)} channel** "
+                f"(mode: approval)."
             )
         else:
             await message.reply_text(
@@ -127,7 +145,7 @@ async def start_command(client, message):
             )
 
 
-# ===================== CALLBACK: CEK ULANG JOIN =====================
+# ===================== CALLBACK: CEK ULANG SETELAH APPROVAL =====================
 
 @app.on_callback_query(filters.regex(r"^check_join:.+"))
 async def recheck_join(client, callback_query):
@@ -138,8 +156,26 @@ async def recheck_join(client, callback_query):
     not_joined = await check_force_join(client, user_id)
 
     if not_joined:
+        # Cek apakah ada yang masih pending (belum disetujui)
+        pending_info = []
+        for ch_id in not_joined:
+            try:
+                member = await client.get_chat_member(ch_id, user_id)
+                if member.status == ChatMemberStatus.RESTRICTED:
+                    chat = await client.get_chat(ch_id)
+                    pending_info.append(chat.title)
+            except Exception:
+                pass
+
+        if pending_info:
+            await callback_query.answer(
+                f"⏳ Masih menunggu persetujuan admin di: {', '.join(pending_info)}",
+                show_alert=True
+            )
+        else:
+            await callback_query.answer("❌ Kamu belum request join semua channel!", show_alert=True)
+
         buttons = await build_join_buttons(client, not_joined, original_code=code)
-        await callback_query.answer("❌ Kamu belum join semua channel!", show_alert=True)
         try:
             await callback_query.message.edit_reply_markup(reply_markup=buttons)
         except Exception:
