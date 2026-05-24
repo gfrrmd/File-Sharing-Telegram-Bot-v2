@@ -1,9 +1,10 @@
 import os
 import string
 import random
+import asyncio
 from pyrogram import Client, filters
 from pyrogram.enums import ChatMemberStatus
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ChatMemberUpdated
 from pyrogram.errors import UserNotParticipant, ChatAdminRequired, ChannelPrivate
 
 # ===================== KONFIGURASI =====================
@@ -22,8 +23,10 @@ FORCE_JOIN_CHANNELS = [
 
 app = Client("file_sharing_bot_v2", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# Database sederhana dalam memori
+# db_links  : { code: message_id_di_db_channel }
+# db_sent   : { user_id: [msg_id_1, msg_id_2, ...] }  ← log semua media yang dikirim ke user
 db_links = {}
+db_sent  = {}
 
 
 def generate_code(length=10):
@@ -31,58 +34,78 @@ def generate_code(length=10):
     return ''.join(random.choices(chars, k=length))
 
 
+def log_sent(user_id: int, msg_id: int):
+    """Catat message_id media yang dikirim ke user."""
+    if user_id not in db_sent:
+        db_sent[user_id] = []
+    db_sent[user_id].append(msg_id)
+
+
+async def revoke_all_media(client, user_id: int):
+    """
+    Hapus semua media yang pernah dikirim bot ke user.
+    Dibagi per batch 100 (batas Telegram API per request).
+    """
+    msg_ids = db_sent.pop(user_id, [])
+    if not msg_ids:
+        return 0
+
+    deleted = 0
+    for i in range(0, len(msg_ids), 100):
+        batch = msg_ids[i:i + 100]
+        try:
+            await client.delete_messages(chat_id=user_id, message_ids=batch)
+            deleted += len(batch)
+        except Exception:
+            pass
+        # Jeda kecil antar batch agar tidak flood
+        await asyncio.sleep(0.3)
+
+    return deleted
+
+
 # ===================== FORCE JOIN LOGIC =====================
 
 async def check_force_join(client, user_id):
-    """
-    Kembalikan list channel_id yang BELUM di-join oleh user.
-    Termasuk user yang masih dalam status pending approval (RESTRICTED).
-    """
+    """Kembalikan list channel_id yang BELUM di-join / belum disetujui user."""
     not_joined = []
     for channel_id in FORCE_JOIN_CHANNELS:
         try:
             member = await client.get_chat_member(channel_id, user_id)
-            # Hanya status MEMBER dan ADMINISTRATOR yang dianggap sudah join
-            # RESTRICTED = pending approval, belum diterima
-            if member.status not in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+            # Hanya MEMBER, ADMINISTRATOR, OWNER yang dianggap aktif
+            if member.status not in (
+                ChatMemberStatus.MEMBER,
+                ChatMemberStatus.ADMINISTRATOR,
+                ChatMemberStatus.OWNER
+            ):
                 not_joined.append(channel_id)
         except UserNotParticipant:
             not_joined.append(channel_id)
         except (ChatAdminRequired, ChannelPrivate):
-            # Bot bukan admin atau channel tidak bisa diakses — fail-closed
             not_joined.append(channel_id)
         except Exception:
-            # Error tak terduga — fail-closed agar aman
             not_joined.append(channel_id)
     return not_joined
 
 
 async def build_join_buttons(client, not_joined_channels, original_code=None):
-    """
-    Buat tombol join per channel menggunakan invite link dengan approval
-    (creates_join_request=True), sehingga user harus disetujui admin dulu.
-    """
+    """Tombol join dengan approval mode per channel."""
     buttons = []
     for ch_id in not_joined_channels:
+        title = "Channel"
         try:
             chat = await client.get_chat(ch_id)
-            # Buat invite link dengan mode approval (request to join)
+            title = chat.title
             invite_obj = await client.create_chat_invite_link(
                 chat_id=ch_id,
                 creates_join_request=True
             )
             invite = invite_obj.invite_link
         except Exception:
-            # Fallback: coba export invite link biasa
             try:
                 invite = await client.export_chat_invite_link(ch_id)
             except Exception:
                 invite = f"https://t.me/c/{str(ch_id).replace('-100', '')}"
-
-        try:
-            title = chat.title
-        except Exception:
-            title = "Channel"
 
         buttons.append([
             InlineKeyboardButton(f"📎 Request Join {title}", url=invite)
@@ -93,6 +116,62 @@ async def build_join_buttons(client, not_joined_channels, original_code=None):
         InlineKeyboardButton("✅ Sudah Disetujui Admin, Coba Lagi", callback_data=callback_data)
     ])
     return InlineKeyboardMarkup(buttons)
+
+
+# ===================== AUTO REVOKE: DETEKSI USER KELUAR CHANNEL =====================
+
+@app.on_chat_member_updated()
+async def on_member_updated(client, update: ChatMemberUpdated):
+    """Deteksi user yang keluar / di-kick dari force join channel."""
+    # Hanya proses channel yang terdaftar di FORCE_JOIN_CHANNELS
+    if not FORCE_JOIN_CHANNELS or update.chat.id not in FORCE_JOIN_CHANNELS:
+        return
+
+    new_status = update.new_chat_member.status if update.new_chat_member else None
+    old_status = update.old_chat_member.status if update.old_chat_member else None
+
+    # Trigger jika sebelumnya aktif, sekarang LEFT atau BANNED
+    was_active = old_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+    now_gone   = new_status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
+
+    if not (was_active and now_gone):
+        return
+
+    user = update.new_chat_member.user
+    user_id = user.id
+
+    # Hapus semua media yang pernah dikirim bot ke user ini
+    deleted_count = await revoke_all_media(client, user_id)
+
+    # Kirim notifikasi ke user
+    try:
+        await client.send_message(
+            chat_id=user_id,
+            text=(
+                "⛔ **Akses Dicabut!**\n\n"
+                "Kamu telah keluar dari channel yang diperlukan.\n"
+                f"**{deleted_count} media** telah dihapus dari chat ini.\n\n"
+                "Jika ingin mengakses kembali, silakan join ulang channel dan minta link baru ke Admin."
+            )
+        )
+    except Exception:
+        pass
+
+    # Notifikasi ke admin
+    try:
+        username = f"@{user.username}" if user.username else user.first_name
+        channel_name = update.chat.title or str(update.chat.id)
+        await client.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                "🔔 **Notif Auto Revoke**\n\n"
+                f"👤 User: {username} (`{user_id}`)\n"
+                f"📢 Keluar dari: **{channel_name}**\n"
+                f"🗑️ Media dihapus: **{deleted_count} pesan**"
+            )
+        )
+    except Exception:
+        pass
 
 
 # ===================== USER INTERFACE =====================
@@ -117,14 +196,15 @@ async def start_command(client, message):
                     )
                     return
 
-            # Sudah join semua → kirim file
+            # Sudah join semua → kirim file & catat ke db_sent
             try:
-                await client.copy_message(
+                sent = await client.copy_message(
                     chat_id=message.chat.id,
                     from_chat_id=DB_CHANNEL,
                     message_id=msg_id,
                     protect_content=True
                 )
+                log_sent(message.from_user.id, sent.id)
             except Exception:
                 await message.reply_text("❌ Gagal mengambil file. Pastikan bot adalah Admin di Channel Database.")
         else:
@@ -135,8 +215,8 @@ async def start_command(client, message):
             await message.reply_text(
                 "👋 **Halo Admin!**\n\nKirim foto, video, atau dokumen ke sini "
                 "untuk diubah menjadi link sharing otomatis.\n\n"
-                f"📌 Force Join aktif untuk **{len(FORCE_JOIN_CHANNELS)} channel** "
-                f"(mode: approval)."
+                f"📌 Force Join aktif untuk **{len(FORCE_JOIN_CHANNELS)} channel** (mode: approval).\n"
+                f"📦 Total user tracked: **{len(db_sent)}**"
             )
         else:
             await message.reply_text(
@@ -156,7 +236,6 @@ async def recheck_join(client, callback_query):
     not_joined = await check_force_join(client, user_id)
 
     if not_joined:
-        # Cek apakah ada yang masih pending (belum disetujui)
         pending_info = []
         for ch_id in not_joined:
             try:
@@ -187,12 +266,13 @@ async def recheck_join(client, callback_query):
             if msg_id:
                 try:
                     await callback_query.message.edit_text("✅ Akses diizinkan! Mengirim file...")
-                    await client.copy_message(
+                    sent = await client.copy_message(
                         chat_id=callback_query.message.chat.id,
                         from_chat_id=DB_CHANNEL,
                         message_id=msg_id,
                         protect_content=True
                     )
+                    log_sent(callback_query.from_user.id, sent.id)
                 except Exception as e:
                     await callback_query.message.edit_text(f"❌ Gagal mengirim file: {str(e)}")
             else:
